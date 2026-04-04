@@ -210,10 +210,6 @@ All methods return responses containing these fields:
 
 Issues and Pull Requests are welcome!
 
-### 📄 License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
 ---
 
 ## 中文
@@ -420,7 +416,3 @@ print(histories)
 ### 🤝 贡献
 
 欢迎提交 Issue 和 Pull Request！
-
-### 📄 许可证
-
-MIT License - 查看 [LICENSE](LICENSE) 文件了解详情。
