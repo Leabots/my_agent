@@ -1,5 +1,6 @@
 from openai import OpenAI
 from .history import History
+from .tool import ToolRegistry
 
 
 class Agent:
@@ -48,59 +49,119 @@ class Agent:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.history = History()
+        self.tool_registry = ToolRegistry()
 
-    def complete(self, user_input: str, record: bool = True):
-        """Send a completion request to the Agent.
+    def register_tool(self, name: str, description: str, handler, param_descriptions: dict = None, return_description: str = None):
+        """Register a function as a tool.
+        
+        Args:
+            name: Tool name (must be unique)
+            description: Tool description for the model
+            handler: Function to execute when tool is called
+            param_descriptions: Optional dict mapping parameter names to descriptions
+            return_description: Optional description of the return value
+        """
+        self.tool_registry.register(name, description, handler, param_descriptions, return_description)
+
+    def complete(self, user_input: str, record: bool = True, max_iterations: int = 10):
+        """Send a completion request to the Agent with automatic tool call handling.
         
         Args:
             user_input: User message to send
             record: Whether to record the interaction in history
+            max_iterations: Maximum number of tool call iterations to prevent infinite loops
             
         Returns:
             The assistant's response
         """
-        res = {}
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         messages = (
             [{"role": "system", "content": self.system_prompt}]
             + self.history.history
             + [{"role": "user", "content": user_input}]
         )
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens
-        )
         
+        tools = self.tool_registry.get_definitions()
+        final_response = None
+        
+        # Loop to handle multiple rounds of tool calls
+        for iteration in range(max_iterations):
+            # Make API call
+            if tools:
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    tools=tools
+                )
+            else:
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens
+                )
+            
+            message = response.choices[0].message
+            
+            # Check if there are tool calls
+            if not hasattr(message, 'tool_calls') or not message.tool_calls:
+                # No tool calls, this is the final response
+                final_response = response
+                break
+            
+            # Has tool calls, add assistant message to conversation
+            messages.append(message)
+            
+            # Execute all tool calls
+            for tool_call in message.tool_calls:
+                result = self.tool_registry.execute(
+                    tool_call.function.name,
+                    tool_call.function.arguments
+                )
+                
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result
+                })
+            
+            # Continue loop to let model process tool results
+        
+        # If we exited loop without a final response (shouldn't happen normally)
+        if final_response is None:
+            final_response = response
+        
+        # Format response
         res = {
-            "id": response.id,
-            "content": response.choices[0].message.content,
-            "model": response.model,
-            "created": response.created,
-            "usage": response.usage,
-            "completion_tokens": response.usage.completion_tokens,
-            "prompt_tokens": response.usage.prompt_tokens,
-            "total_tokens": response.usage.total_tokens,
-            "finish_reason": response.choices[0].finish_reason,
-            "system_fingerprint": response.system_fingerprint
+            "id": final_response.id,
+            "content": final_response.choices[0].message.content,
+            "model": final_response.model,
+            "created": final_response.created,
+            "usage": final_response.usage,
+            "completion_tokens": final_response.usage.completion_tokens,
+            "prompt_tokens": final_response.usage.prompt_tokens,
+            "total_tokens": final_response.usage.total_tokens,
+            "finish_reason": final_response.choices[0].finish_reason,
+            "system_fingerprint": final_response.system_fingerprint
         }
         
         # Add completion_tokens_details if available
-        if hasattr(response.usage, 'completion_tokens_details') and response.usage.completion_tokens_details is not None:
-            if hasattr(response.usage.completion_tokens_details, 'audio_tokens'):
-                res['completion_tokens_audio_tokens'] = response.usage.completion_tokens_details.audio_tokens
+        if hasattr(final_response.usage, 'completion_tokens_details') and final_response.usage.completion_tokens_details is not None:
+            if hasattr(final_response.usage.completion_tokens_details, 'audio_tokens'):
+                res['completion_tokens_audio_tokens'] = final_response.usage.completion_tokens_details.audio_tokens
         
         # Add prompt_tokens_details if available
-        if hasattr(response.usage, 'prompt_tokens_details') and response.usage.prompt_tokens_details is not None:
-            if hasattr(response.usage.prompt_tokens_details, 'audio_tokens'):
-                res['prompt_tokens_audio_tokens'] = response.usage.prompt_tokens_details.audio_tokens
-            if hasattr(response.usage.prompt_tokens_details, 'cached_tokens'):
-                res['prompt_tokens_cached_tokens'] = response.usage.prompt_tokens_details.cached_tokens
+        if hasattr(final_response.usage, 'prompt_tokens_details') and final_response.usage.prompt_tokens_details is not None:
+            if hasattr(final_response.usage.prompt_tokens_details, 'audio_tokens'):
+                res['prompt_tokens_audio_tokens'] = final_response.usage.prompt_tokens_details.audio_tokens
+            if hasattr(final_response.usage.prompt_tokens_details, 'cached_tokens'):
+                res['prompt_tokens_cached_tokens'] = final_response.usage.prompt_tokens_details.cached_tokens
         
         if record:
             self.history.push("user", user_input)
-            self.history.push("assistant", response.choices[0].message.content)
+            self.history.push("assistant", final_response.choices[0].message.content)
         
         return res
 
@@ -115,13 +176,13 @@ class Agent:
             The assistant's response with content as a Python JSON object
         """
         import json
-        res = {}
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         messages = (
             [{"role": "system", "content": self.system_prompt}]
             + self.history.history
             + [{"role": "user", "content": user_input}]
         )
+        
         response = client.chat.completions.create(
             model=self.model,
             messages=messages,
@@ -170,7 +231,7 @@ class Agent:
 
     def __str__(self):
         """Return string representation of the agent."""
-        agent_str = f"url: {self.base_url}, model: {self.model}"
+        agent_str = f"url: {self.base_url}, model: {self.model}, tools: {len(self.tool_registry)}"
         return agent_str
 
     def clear_history(self):
@@ -207,26 +268,141 @@ class Agent:
         """
         return self.history.get_saves()
 
-    def stream_complete(self, user_input: str, record: bool = True):
-        """Send a streaming completion request to the Agent.
+    def stream_complete(self, user_input: str, record: bool = True, tool_call_messages: dict = None, max_iterations: int = 5):
+        """Send a streaming completion request to the Agent with tool call support."""
+        import re
+        import json
         
-        This method yields response chunks as they arrive from the API.
-        After the complete response is received, it will be saved to history.
-        
-        Args:
-            user_input: User message to send
-            record: Whether to record the interaction in history
-            
-        Yields:
-            Chunks of the assistant's response with metadata
-        """
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         messages = (
             [{"role": "system", "content": self.system_prompt}]
             + self.history.history
             + [{"role": "user", "content": user_input}]
         )
-        response = client.chat.completions.create(
+        
+        tools = self.tool_registry.get_definitions()
+        tool_call_messages = tool_call_messages or {}
+        
+        if tools:
+            for iteration in range(max_iterations):
+                # 第一次调用：检测是否有 tool_calls
+                response = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    tools=tools
+                )
+                
+                message = response.choices[0].message
+                content = message.content or ""
+                
+                # 检查是否包含文本格式的 tool_calls
+                tool_call_pattern = r'<｜｜DSML｜｜tool_calls>.*?</｜｜DSML｜｜tool_calls>'
+                has_text_tool_calls = re.search(tool_call_pattern, content, re.DOTALL)
+                has_standard_tool_calls = hasattr(message, 'tool_calls') and message.tool_calls
+                
+                if has_text_tool_calls or has_standard_tool_calls:
+                    # 有工具调用：解析并执行
+                    if has_text_tool_calls:
+                        tool_calls_section = re.search(r'<｜｜DSML｜｜tool_calls>(.*?)</｜｜DSML｜｜tool_calls>', content, re.DOTALL)
+                        if tool_calls_section:
+                            invoke_pattern = r'<｜｜DSML｜｜invoke name="(\w+)">(.*?)</｜｜DSML｜｜invoke>'
+                            tool_calls_data = re.findall(invoke_pattern, tool_calls_section.group(1), re.DOTALL)
+                            
+                            for tool_name, params_str in tool_calls_data:
+                                if tool_name in tool_call_messages:
+                                    yield {
+                                        "type": "tool_call",
+                                        "tool_name": tool_name,
+                                        "delta": tool_call_messages[tool_name],
+                                    }
+                                
+                                param_pattern = r'<｜｜DSML｜｜parameter name="(\w+)" string="true">(.*?)</｜｜DSML｜｜parameter>'
+                                params = {}
+                                for param_name, param_value in re.findall(param_pattern, params_str, re.DOTALL):
+                                    params[param_name] = param_value
+                                
+                                result = self.tool_registry.execute(tool_name, json.dumps(params))
+                                
+                                messages.append({"role": "assistant", "content": content})
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": f"call_{tool_name}",
+                                    "content": result
+                                })
+                    
+                    elif has_standard_tool_calls:
+                        for tool_call in message.tool_calls:
+                            tool_name = tool_call.function.name
+                            if tool_name in tool_call_messages:
+                                yield {
+                                    "type": "tool_call",
+                                    "tool_name": tool_name,
+                                    "delta": tool_call_messages[tool_name],
+                                }
+                        
+                        messages.append(message)
+                        
+                        for tool_call in message.tool_calls:
+                            result = self.tool_registry.execute(
+                                tool_call.function.name,
+                                tool_call.function.arguments
+                            )
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": result
+                            })
+                    
+                    # 继续下一轮
+                    continue
+                
+                # 没有 tool_calls：这是最终回复，使用流式 API 输出
+                # 关键：使用流式 API，不要直接输出静态 content
+                stream_response = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    stream=True
+                )
+                
+                full_content = ""
+                response_id = None
+                model_name = None
+                created = None
+                system_fingerprint = None
+                
+                for chunk in stream_response:
+                    if response_id is None:
+                        response_id = chunk.id
+                        model_name = chunk.model
+                        created = chunk.created
+                        system_fingerprint = chunk.system_fingerprint
+                    
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        chunk_res = {
+                            "type": "response",
+                            "delta": delta.content,
+                        }
+                        full_content += delta.content
+                        yield chunk_res
+                
+                # 保存到历史
+                if record and full_content:
+                    self.history.push("user", user_input)
+                    self.history.push("assistant", full_content)
+                
+                yield {"done": True, "final_response": {"content": full_content}}
+                return
+            
+            yield {"done": True, "error": "Max iterations reached"}
+            return
+        
+        # 没有工具，普通流式输出
+        stream_response = client.chat.completions.create(
             model=self.model,
             messages=messages,
             temperature=self.temperature,
@@ -235,82 +411,14 @@ class Agent:
         )
         
         full_content = ""
-        response_id = None
-        model_name = None
-        created = None
-        system_fingerprint = None
-        total_completion_tokens = 0
-        total_prompt_tokens = 0
-        usage = None
-        
-        for chunk in response:
-            chunk_res = {}
-            
-            # Capture metadata from first chunk
-            if response_id is None:
-                response_id = chunk.id
-                model_name = chunk.model
-                created = chunk.created
-                system_fingerprint = chunk.system_fingerprint
-            
-            chunk_res['id'] = chunk.id
-            chunk_res['model'] = chunk.model
-            chunk_res['created'] = chunk.created
-            chunk_res['system_fingerprint'] = chunk.system_fingerprint
-            
-            # Get content delta
+        for chunk in stream_response:
             delta = chunk.choices[0].delta
-            if delta.content is not None:
-                chunk_res['delta'] = delta.content
+            if delta.content:
+                yield {"type": "response", "delta": delta.content}
                 full_content += delta.content
-            else:
-                chunk_res['delta'] = ""
-            
-            chunk_res['full_content'] = full_content
-            chunk_res['finish_reason'] = chunk.choices[0].finish_reason
-            
-            # Handle usage information (some providers send this in the last chunk)
-            if hasattr(chunk, 'usage') and chunk.usage is not None:
-                usage = chunk.usage
-                chunk_res['usage'] = chunk.usage
-                chunk_res['completion_tokens'] = chunk.usage.completion_tokens
-                chunk_res['prompt_tokens'] = chunk.usage.prompt_tokens
-                chunk_res['total_tokens'] = chunk.usage.total_tokens
-                total_completion_tokens = chunk.usage.completion_tokens
-                total_prompt_tokens = chunk.usage.prompt_tokens
-            
-            yield chunk_res
         
-        # After streaming completes, save to history if requested
         if record and full_content:
             self.history.push("user", user_input)
             self.history.push("assistant", full_content)
         
-        # Create a final response with complete information
-        final_res = {
-            "id": response_id,
-            "content": full_content,
-            "model": model_name,
-            "created": created,
-            "finish_reason": "stop",
-            "system_fingerprint": system_fingerprint,
-            "completion_tokens": total_completion_tokens,
-            "prompt_tokens": total_prompt_tokens,
-            "total_tokens": total_completion_tokens + total_prompt_tokens
-        }
-        
-        # Add extra usage details if available
-        if usage is not None:
-            # Add completion_tokens_details if available for streaming
-            if hasattr(usage, 'completion_tokens_details') and usage.completion_tokens_details is not None:
-                if hasattr(usage.completion_tokens_details, 'audio_tokens'):
-                    final_res['completion_tokens_audio_tokens'] = usage.completion_tokens_details.audio_tokens
-            
-            # Add prompt_tokens_details if available for streaming
-            if hasattr(usage, 'prompt_tokens_details') and usage.prompt_tokens_details is not None:
-                if hasattr(usage.prompt_tokens_details, 'audio_tokens'):
-                    final_res['prompt_tokens_audio_tokens'] = usage.prompt_tokens_details.audio_tokens
-                if hasattr(usage.prompt_tokens_details, 'cached_tokens'):
-                    final_res['prompt_tokens_cached_tokens'] = usage.prompt_tokens_details.cached_tokens
-        
-        yield {"done": True, "final_response": final_res}
+        yield {"done": True, "final_response": {"content": full_content}}
